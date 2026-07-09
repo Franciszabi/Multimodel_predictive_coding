@@ -1,0 +1,57 @@
+# Local environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+.cursor/
+.vscode/
+
+# Data, checkpoints, and generated outputs
+data/
+experiments/
+analysis_out/
+notebooks/
+*.ipynb
+oldscripts/
+bash_scripts/
+vlmpc_*/
+*.ckpt
+*.pt
+*.pth
+*.npy
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.mp4
+
+# Temporary files
+_tmp_*
+*.tmp
+
+# Legacy and scratch scripts kept locally but not published
+a[0-9][0-9]_*.py
+test.py
+test_*.py
+concept_cell_*.py
+fetch_w2v.py
+inspect_vocab_keys.py
+clean_hiddenfile.py
+temporal_horizon_analysis.py
+PROJECT_OVERVIEW.md
+pipeline.txt
+semantic_gpt.txt
+ssh.txt
+.cursorignore
+src/analysis.py
+src/trainer.py
+src/utils.py
+src/data_prepare/
+src/models/attention.py
+src/models/encoder_decoder.py
+src/models/residual.py
