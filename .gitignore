@@ -11,7 +11,7 @@ __pycache__/
 .vscode/
 
 # Data, checkpoints, and generated outputs
-data/
+/data/
 experiments/
 analysis_out/
 notebooks/

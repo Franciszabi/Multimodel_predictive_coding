@@ -1,102 +1,150 @@
 # Semantic Predictive Coding Pipeline
 
-This repository contains the current working semantic-only pipeline for the
-Twin Mansion predictive coding experiments. Large data files, model checkpoints,
-notebooks, old multimodal scripts, and generated analysis outputs are intentionally
-excluded from version control.
+This repository contains the active semantic-only pipeline for the Twin Mansion
+predictive-coding experiments. Data, checkpoints, generated analyses, and legacy
+multimodal scripts are intentionally excluded from version control.
 
-## Current Focus
+## Scientific Contract
 
-The active code path studies representations learned from semantic object-label
-sequences, without visual frames or position supervision.
-
-The core workflow is:
-
-1. Train a pure semantic Transformer model with `train_semantic_gpt.py`.
-2. Train a frame-wise semantic autoencoder baseline with `train_semantic_ae.py`.
-3. Export cached latents on predefined trajectories with `semantic_gpt_latent.py`
-   or the extraction step in `train_semantic_ae.py`.
-4. Analyze latent structure with position decoding, vocabulary selectivity, and
-   placefield-style spatial projections.
-
-## Data Layout
-
-Data is not included in the repository. The scripts expect local files with this
-general structure:
+`SemanticGPT` is a future-prediction model. For a window starting at frame `s`:
 
 ```text
-data_root/
-  vocabulary.npy
-  data_...samples/
-    path1/
-      objects_map.npy
-      positions.npy
-    path2/
-      objects_map.npy
-      positions.npy
-  pre_defined_path_samples/
-    objects_map.npy
-    positions.npy
+input  = semantics[s : s + L]
+target = semantics[s + h : s + h + L]
 ```
 
-`objects_map.npy` is a frame-by-vocabulary multi-hot matrix. `vocabulary.npy`
-contains the object names whose indices match the columns of `objects_map.npy`.
-Object names are split on underscores to form subword token sequences.
+The default horizon is `h=1`. At output position `t`, frame-causal attention
+allows the latent to use semantic tokens from frames `<=t` only, while its target
+is frame `t+h`. Tokens inside one frame are an unordered set and are mutually
+visible. Future frames and padding tokens cannot be attended to.
 
-## Models
+The semantic autoencoder is intentionally different: it reconstructs the current
+frame from the current frame and has no temporal input. It is the same-frame
+baseline for dilation and latent comparisons.
 
-`SemanticGPT` is defined in `src/models/semantic_gpt.py`.
+Neither model uses position, state, actions, room ID, map labels, images, or
+visual/semantic factors as input or training targets. State and actions may be
+exported beside latents for post-hoc probes only.
 
-- Input: token ids and masks with shape `(B, L, K)`.
-- Default sequence length: `L=25`.
-- Default tokens per frame: `K=16`.
-- Object names are tokenized into subwords, embedded, and given frame-only
-  sinusoidal positional encodings.
-- Frame-token pairs are flattened to length `L*K` and processed by causal
-  self-attention blocks.
-- The final per-frame latent is a masked mean over tokens, shape `(B, L, D)`.
-- The head predicts a multi-label object vector for each frame.
+## Trail Dataset
 
-`SemanticFrameAutoencoder` is defined in `src/models/semantic_autoencoder.py`.
+The primary dataset is a Unity trail directory:
 
-- It flattens time into the batch dimension: `(B, L, K) -> (B*L, K)`.
-- It reconstructs each frame from only that frame's semantic tokens.
-- It does not receive other frames, position, images, path ids, or temporal order.
-- It is used as a reconstruction baseline for the semantic latent analyses.
+```text
+trail_YYYYMMDD_HHMMSS_FRAMECOUNT/
+  semantics.jsonl
+  state.npy
+  actions.npy
+  unity_frames.npy
+  episodes.npy
+  frame_index.jsonl
+  occupancy.npy
+  navigation.json
+  object_map.csv
+  meta.json
+  pathN/
+    ...
+```
 
-Important caveat: the current `train_semantic_gpt.py` objective predicts the
-same-frame semantic multi-hot target, not a shifted next-frame target. This makes
-the current Transformer closer to a causal semantic reconstruction model than a
-strict next-step predictive coding model.
+`semantics.jsonl` is the authoritative model data source. Each line is one global
+frame and should contain atomic strings under a supported field such as
+`modelTokens`, `model_tokens`, `tokens`, or `visibleTokens`. A token such as
+`S1_core`, `<ANCHOR_0>`, or `prop_bed_08` maps to one ID and is never split on
+underscores.
 
-## Main Scripts
+Vocabulary discovery follows this order:
 
-- `train_semantic_gpt.py`: train the semantic Transformer.
-- `train_semantic_ae.py`: train the frame-wise semantic autoencoder baseline.
-- `eval_semantic_ae.py`: evaluate an autoencoder checkpoint on multi-label metrics.
-- `semantic_gpt_latent.py`: export Transformer latents on predefined trajectories.
-- `semantic_gpt_error_map.py`: train a position decoder from cached latents and plot
-  spatial error maps.
-- `semantic_gpt_vocab_select.py`: compute channel-by-vocabulary activation heatmaps.
-- `semantic_gpt_vocab_selectivity.py`: rank channels by vocabulary selectivity.
-- `semantic_gpt_placefield.py`: project high-activation latent channels back onto
-  the environment map.
-- `make_semantic_degenerate.py`: build controlled semantic aliasing datasets by
-  merging object-label columns.
+1. `--vocab_path`
+2. an explicit semantic vocabulary in `meta.json`
+3. a `modelToken`, `token`, or `semanticLabel` column in `object_map.csv`
+4. a deterministic scan of `semantics.jsonl`
 
-## Installation
+A scene table with only columns such as `name`, `cx`, `cy`, and `cz` is not used
+as the semantic vocabulary. The finalized mapping is saved as
+`semantic_vocab.json` beside each checkpoint.
 
-Create a Python environment and install the minimal dependencies:
+Inspect raw tokens, atomic IDs, decoded IDs, and multi-hot targets before training:
+
+```bash
+python scripts/inspect_semantic_tokens.py \
+  --data_root data/trail_latest \
+  --start_frame 0 \
+  --num_frames 5
+```
+
+Sliding windows use `stride=1` by default and never cross episode boundaries.
+When no separate validation trail is provided, the split is episode-based. A
+single-episode dataset falls back to sequence-level splitting with a warning.
+
+## Training
+
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-GPU acceleration is optional but recommended for training.
+Train future-predictive SemanticGPT:
 
-## Notes for Collaboration
+```bash
+python train_semantic_gpt.py \
+  --data_root data/trail_latest \
+  --out_dir experiments/semantic_gpt \
+  --sequence_length 25 \
+  --horizon 1 \
+  --stride 1 \
+  --device cuda
+```
 
-Before asking another agent or online model to reason about this project, point it
-to this README and the files listed above. Avoid using the legacy `a00`-`a04` and
-`a94`-`a99` scripts as source of truth unless explicitly revisiting older
-multimodal experiments.
+Train the same-frame autoencoder baseline:
+
+```bash
+python train_semantic_ae.py \
+  --data_root data/trail_latest \
+  --out_dir experiments/semantic_ae \
+  --sequence_length 25 \
+  --stride 1 \
+  --device cuda
+```
+
+Export SemanticGPT latents and aligned post-hoc metadata:
+
+```bash
+python semantic_gpt_latent.py \
+  --data_root data/trail_latest \
+  --ckpt experiments/semantic_gpt/best.ckpt \
+  --out_npz analysis_out/semantic_gpt_latents.npz \
+  --device cuda
+```
+
+The NPZ contains `z`, `semantics_input`, `semantics_target`, predictions, input
+and target frame indices, and episode IDs. When present in the trail, it also
+contains state/actions/Unity frame IDs and image paths. Compatibility aliases
+`semantics` and `positions` are retained; `positions` is the input state ordered
+as `(x, z, yaw)`.
+
+## Smoke Checks
+
+These checks are small and CPU-safe:
+
+```bash
+python scripts/smoke_test_atomic_tokenizer.py
+python scripts/inspect_semantic_tokens.py --data_root data/trail_latest --num_frames 5
+python scripts/smoke_test_semantic_dataset.py
+python scripts/smoke_test_frame_causal_mask.py
+python scripts/dry_run_train_semantic_gpt.py
+python scripts/dry_run_train_semantic_ae.py
+```
+
+See `COLAB_TRAINING.md` for a Drive-based Colab workflow.
+
+## Analysis Scripts
+
+- `semantic_gpt_error_map.py`: position-decoder error maps from cached latents.
+- `semantic_gpt_vocab_select.py`: channel-by-token activation heatmaps.
+- `semantic_gpt_vocab_selectivity.py`: rank token-selective latent channels.
+- `semantic_gpt_placefield.py`: project latent activations onto state coordinates.
+- `make_semantic_degenerate.py`: create semantic aliasing controls for legacy data.
+
+The old `a00`-`a04` and `a94`-`a99` scripts are not the source of truth for this
+pipeline.

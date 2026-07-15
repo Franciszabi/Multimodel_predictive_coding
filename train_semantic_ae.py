@@ -1,404 +1,354 @@
-"""
-Train frame-wise Semantic Autoencoder (ablation: no temporal modeling).
-
-This script reuses the existing semantic data layout and tokenizer from
-`a97_train_semantic_gpt.py`, but changes training target to same-frame
-reconstruction:
-  - input:  token_ids, token_mask from current frame
-  - target: current-frame multi-hot semantics
-
-Crucially, time dimension is flattened into batch:
-  (B, L, K) -> (B*L, K)
-  (B, L, V) -> (B*L, V)
-
-Usage:
-  python train_semantic_ae.py
-"""
+"""Train the non-temporal, same-frame semantic autoencoder baseline."""
 
 from __future__ import annotations
 
+import argparse
+import json
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Sequence
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
-from train_semantic_gpt import (
-    SubwordTokenizer,
-    SemanticSequenceDatasetFromPaths,
-    load_vocabulary,
-)
+from src.data.semantic_tokenizer import build_atomic_tokenizer
+from src.data.trail_semantic_dataset import TrailSemanticSequenceDataset
 from src.models.semantic_autoencoder import SemanticFrameAutoencoder
+from train_semantic_gpt import limited_dataset, resolve_device, resolve_path, set_seed
 
 
-# --------------- Script config (edit here) ---------------
-DATA_ROOT = Path("/home/ubuntu/project/data/data_11272025_twinmansion/data_11272025_100000samples")  # or str
-VAL_DATA_ROOT: Optional[Path] = Path("/home/ubuntu/project/data/data_11272025_twinmansion/data_11272025_50000samples") # None = split from DATA_ROOT 90/10
-OUT_DIR = Path("experiments/semantic_ae")
-
-SEQUENCE_LENGTH = 25
-MAX_TOKENS_PER_FRAME = 16
-PAD_TOKEN_ID = 0
-
-BATCH_SIZE = 32
-EPOCHS = 80
-LR = 1e-3
-WEIGHT_DECAY = 0.0
-
-# model dims
-D_MODEL = 256
-BOTTLENECK_DIM = 64
-HIDDEN_DIM = 256
-DROPOUT = 0.1
-
-EARLY_STOPPING_PATIENCE = 3
-NUM_WORKERS = 0
-TRAIN_VAL_SPLIT = 0.9
-
-# latent extraction for downstream placefield / vocab_select
-EXTRACT_LATENTS_AFTER_TRAIN = True
-EXTRACT_DATA_ROOT = Path("/home/ubuntu/project/data/data_11272025_twinmansion/pre_defined_path_samples")
-EXTRACT_OUT_NPZ = Path("/home/ubuntu/project/analysis_out/semantic_ae_predefined_latents/latents_on_grid_ae.npz")
-EXTRACT_BATCH_SIZE = 64
-LATENT_SOURCE = "pooled"  # "pooled" (recommended for fair compare) or "bottleneck"
-# ---------------------------------------------------------
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train a frame-wise current-semantic reconstruction baseline."
+    )
+    parser.add_argument("--data_root", default="data/trail_latest")
+    parser.add_argument("--val_data_root", default="")
+    parser.add_argument("--out_dir", default="experiments/semantic_ae")
+    parser.add_argument("--vocab_path", default="")
+    parser.add_argument("--sequence_length", type=int, default=25)
+    parser.add_argument("--max_tokens_per_frame", type=int, default=16)
+    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--bottleneck_dim", type=int, default=64)
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--early_stopping_patience", type=int, default=3)
+    parser.add_argument("--limit_train_samples", type=int, default=0)
+    parser.add_argument("--limit_val_samples", type=int, default=0)
+    parser.add_argument("--val_fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--include_empty_token",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--extract_data_root", default="")
+    parser.add_argument("--extract_out_npz", default="")
+    parser.add_argument("--extract_batch_size", type=int, default=64)
+    parser.add_argument("--limit_extract_samples", type=int, default=0)
+    parser.add_argument("--latent_source", choices=("pooled", "bottleneck"), default="pooled")
+    return parser.parse_args(argv)
 
 
 def flatten_frames(
-    token_ids: torch.Tensor,    # (B,L,K)
-    token_mask: torch.Tensor,   # (B,L,K)
-    targets: torch.Tensor,      # (B,L,V)
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    b, l, k = token_ids.shape
-    v = targets.shape[-1]
-    token_ids_f = token_ids.reshape(b * l, k)
-    token_mask_f = token_mask.reshape(b * l, k)
-    targets_f = targets.reshape(b * l, v)
-    return token_ids_f, token_mask_f, targets_f
+    token_ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    current_targets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flatten time into batch; this baseline has no temporal information."""
+
+    batch_size, length, width = token_ids.shape
+    classes = current_targets.shape[-1]
+    return (
+        token_ids.reshape(batch_size * length, width),
+        token_mask.reshape(batch_size * length, width),
+        current_targets.reshape(batch_size * length, classes),
+    )
 
 
-def train_one_epoch(
+def make_datasets(
+    args: argparse.Namespace,
+    tokenizer,
+    data_root: Path,
+    val_data_root: Path | None,
+) -> tuple[TrailSemanticSequenceDataset, TrailSemanticSequenceDataset]:
+    # horizon=0 is intentional: AE reconstructs only the current frame.
+    common = dict(
+        tokenizer=tokenizer,
+        sequence_length=args.sequence_length,
+        horizon=0,
+        max_tokens_per_frame=args.max_tokens_per_frame,
+        stride=args.stride,
+        include_actions=False,
+        return_metadata=False,
+        include_empty_token=args.include_empty_token,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
+    )
+    if val_data_root is not None:
+        return (
+            TrailSemanticSequenceDataset(data_root, split_policy="all", **common),
+            TrailSemanticSequenceDataset(val_data_root, split_policy="all", **common),
+        )
+    return (
+        TrailSemanticSequenceDataset(data_root, split_policy="train", **common),
+        TrailSemanticSequenceDataset(data_root, split_policy="val", **common),
+    )
+
+
+def run_epoch(
     model: SemanticFrameAutoencoder,
     loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
     device: torch.device,
+    optimizer: torch.optim.Optimizer | None,
 ) -> float:
-    model.train()
+    training = optimizer is not None
+    model.train(training)
     total_loss = 0.0
-    n_frames = 0
+    total_frames = 0
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        for token_ids, token_mask, current_targets in loader:
+            token_ids = token_ids.to(device, non_blocking=True)
+            token_mask = token_mask.to(device, non_blocking=True)
+            current_targets = current_targets.to(device, non_blocking=True)
+            token_ids, token_mask, current_targets = flatten_frames(
+                token_ids, token_mask, current_targets
+            )
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+            logits = model(token_ids, token_mask)
+            loss = F.binary_cross_entropy_with_logits(logits, current_targets)
+            if optimizer is not None:
+                loss.backward()
+                optimizer.step()
+            total_loss += float(loss.item()) * token_ids.shape[0]
+            total_frames += token_ids.shape[0]
+    return total_loss / max(total_frames, 1)
 
-    for token_ids, token_mask, targets in loader:
-        token_ids = token_ids.to(device)
-        token_mask = token_mask.to(device)
-        targets = targets.to(device)
 
-        token_ids_f, token_mask_f, targets_f = flatten_frames(token_ids, token_mask, targets)
-
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(token_ids_f, token_mask_f)  # (B*L, V)
-        loss = F.binary_cross_entropy_with_logits(logits, targets_f, reduction="mean")
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * token_ids_f.size(0)
-        n_frames += token_ids_f.size(0)
-
-    return total_loss / max(n_frames, 1)
+def checkpoint_payload(
+    model: SemanticFrameAutoencoder,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+    tokenizer,
+    epoch: int,
+    best_val_loss: float,
+) -> dict:
+    return {
+        "format_version": 2,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": config,
+        "semantic_vocab": tokenizer.to_dict(),
+        "epoch": int(epoch),
+        "best_val_loss": float(best_val_loss),
+    }
 
 
 @torch.no_grad()
-def eval_loss(
+def extract_latents(
     model: SemanticFrameAutoencoder,
-    loader: DataLoader,
+    tokenizer,
+    args: argparse.Namespace,
     device: torch.device,
-) -> float:
-    model.eval()
-    total_loss = 0.0
-    n_frames = 0
-
-    for token_ids, token_mask, targets in loader:
-        token_ids = token_ids.to(device)
-        token_mask = token_mask.to(device)
-        targets = targets.to(device)
-
-        token_ids_f, token_mask_f, targets_f = flatten_frames(token_ids, token_mask, targets)
-        logits = model(token_ids_f, token_mask_f)
-        loss = F.binary_cross_entropy_with_logits(logits, targets_f, reduction="mean")
-
-        total_loss += loss.item() * token_ids_f.size(0)
-        n_frames += token_ids_f.size(0)
-
-    return total_loss / max(n_frames, 1)
-
-
-def build_dataloaders() -> Tuple[DataLoader, DataLoader, int, int]:
-    data_root = Path(DATA_ROOT)
-    if not data_root.exists():
-        raise FileNotFoundError(f"DATA_ROOT not found: {data_root}")
-
-    v, vocabulary = load_vocabulary(data_root)
-    tokenizer = SubwordTokenizer(vocabulary)
-    vocab_size = tokenizer.vocab_size
-
-    train_dataset = SemanticSequenceDatasetFromPaths(
-        root=data_root,
-        vocabulary=vocabulary,
-        subword_tokenizer=tokenizer,
-        sequence_length=SEQUENCE_LENGTH,
-        max_tokens_per_frame=MAX_TOKENS_PER_FRAME,
-        pad_token_id=PAD_TOKEN_ID,
-        objmap_name="objects_map.npy",
+    data_root: Path,
+    out_npz: Path,
+) -> None:
+    dataset = TrailSemanticSequenceDataset(
+        data_root=data_root,
+        tokenizer=tokenizer,
+        sequence_length=args.sequence_length,
+        horizon=0,
+        max_tokens_per_frame=args.max_tokens_per_frame,
+        stride=args.stride,
+        split_policy="all",
+        include_actions=True,
+        return_metadata=True,
+        include_empty_token=args.include_empty_token,
+    )
+    dataset_for_loader: Dataset = dataset
+    if 0 < args.limit_extract_samples < len(dataset):
+        dataset_for_loader = Subset(dataset, range(args.limit_extract_samples))
+    loader = DataLoader(
+        dataset_for_loader,
+        batch_size=args.extract_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
     )
 
-    if VAL_DATA_ROOT is not None:
-        val_dataset: Dataset = SemanticSequenceDatasetFromPaths(
-            root=Path(VAL_DATA_ROOT),
-            vocabulary=vocabulary,
-            subword_tokenizer=tokenizer,
-            sequence_length=SEQUENCE_LENGTH,
-            max_tokens_per_frame=MAX_TOKENS_PER_FRAME,
-            pad_token_id=PAD_TOKEN_ID,
-            objmap_name="objects_map.npy",
+    outputs: dict[str, list[np.ndarray]] = {
+        "z": [],
+        "semantics": [],
+        "semantic_logits": [],
+        "frame_indices_input": [],
+        "episode_ids": [],
+    }
+    model.eval()
+    for token_ids, token_mask, current_targets, metadata in loader:
+        batch_size, length, width = token_ids.shape
+        ids_flat = token_ids.to(device).reshape(batch_size * length, width)
+        mask_flat = token_mask.to(device).reshape(batch_size * length, width)
+        logits_flat, latents = model(ids_flat, mask_flat, return_latents=True)
+        feature = latents[args.latent_source]
+        channels = feature.shape[-1]
+        outputs["z"].append(
+            feature.reshape(batch_size, length, channels).cpu().numpy()[:, :, :, None, None]
         )
-    else:
-        n_total = len(train_dataset)
-        n_train = int(n_total * TRAIN_VAL_SPLIT)
-        n_val = n_total - n_train
-        g = torch.Generator().manual_seed(42)
-        train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [n_train, n_val], generator=g)
+        outputs["semantics"].append(current_targets.numpy())
+        outputs["semantic_logits"].append(
+            logits_flat.reshape(batch_size, length, -1).cpu().numpy()
+        )
+        outputs["frame_indices_input"].append(metadata["frame_indices_input"].numpy())
+        outputs["episode_ids"].append(metadata["episode_id"].numpy())
+        if "state_input" in metadata:
+            outputs.setdefault("state_input", []).append(metadata["state_input"].numpy())
+
+    saved = {key: np.concatenate(value, axis=0) for key, value in outputs.items()}
+    if "state_input" in saved:
+        saved["positions"] = saved["state_input"]
+        saved["state_columns"] = np.asarray(["x", "z", "yaw"])
+    saved["latent_source"] = np.asarray(args.latent_source)
+    saved["tokenizer_type"] = np.asarray("atomic")
+    saved["semantic_tokens"] = np.asarray(tokenizer.tokens)
+    out_npz.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_npz, **saved)
+    print(f"[extract] saved={out_npz} z={saved['z'].shape}")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    set_seed(args.seed)
+    data_root = resolve_path(args.data_root)
+    val_data_root = resolve_path(args.val_data_root) if args.val_data_root else None
+    out_dir = resolve_path(args.out_dir)
+    vocab_path = resolve_path(args.vocab_path) if args.vocab_path else None
+    if not data_root.exists():
+        raise FileNotFoundError(f"data_root not found: {data_root}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tokenizer, vocab_source = build_atomic_tokenizer(
+        data_root,
+        vocab_path=vocab_path,
+        include_empty_token=args.include_empty_token,
+    )
+    tokenizer.save(out_dir / "semantic_vocab.json")
+    train_raw, val_raw = make_datasets(args, tokenizer, data_root, val_data_root)
+    train_dataset = limited_dataset(train_raw, args.limit_train_samples)
+    val_dataset = limited_dataset(val_raw, args.limit_val_samples)
+    device = resolve_device(args.device)
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
     )
-    return train_loader, val_loader, vocab_size, v
-
-
-def reshape_to_seq(arr: np.ndarray, seq_len: int) -> np.ndarray:
-    """
-    Normalize arrays to (N, seq_len, D) for either:
-      - (N, L, D): if L != seq_len, flatten and re-chunk
-      - (N*L, D): directly reshape
-    """
-    seq_len = int(seq_len)
-    if arr.ndim == 3:
-        n, l, d = arr.shape
-        if l == seq_len:
-            return arr
-        t = n * l
-        if t % seq_len != 0:
-            raise ValueError(f"Total length T={t} not divisible by seq_len={seq_len}")
-        return arr.reshape(t // seq_len, seq_len, d)
-    if arr.ndim == 2:
-        t, d = arr.shape
-        if t % seq_len != 0:
-            raise ValueError(f"Total length T={t} not divisible by seq_len={seq_len}")
-        return arr.reshape(t // seq_len, seq_len, d)
-    raise ValueError(f"Expected ndim 2 or 3, got shape={arr.shape}")
-
-
-class PredefinedPathSemanticDatasetWithPos(Dataset):
-    """
-    Load from a single directory containing:
-      - objects_map.npy: (N,L,V) or (N*L,V)
-      - positions.npy:   (N,L,3) or (N*L,3)
-    Build token_ids/token_mask and return aligned positions.
-    """
-
-    def __init__(
-        self,
-        root: Path,
-        vocabulary: np.ndarray,
-        subword_tokenizer: SubwordTokenizer,
-        sequence_length: int,
-        max_tokens_per_frame: int = MAX_TOKENS_PER_FRAME,
-        pad_token_id: int = PAD_TOKEN_ID,
-        thr: float = 0.5,
-    ):
-        self.root = Path(root)
-        self.vocabulary = np.atleast_1d(vocabulary)
-        self.tokenizer = subword_tokenizer
-        self.sequence_length = int(sequence_length)
-        self.max_tokens_per_frame = int(max_tokens_per_frame)
-        self.pad_token_id = int(pad_token_id)
-        self.thr = float(thr)
-
-        objmap = np.load(self.root / "objects_map.npy", allow_pickle=True)
-        pos = np.load(self.root / "positions.npy", allow_pickle=True)
-        objmap = reshape_to_seq(objmap, self.sequence_length)  # (N,L,V)
-        pos = reshape_to_seq(pos, self.sequence_length)        # (N,L,3)
-        if objmap.shape[:2] != pos.shape[:2]:
-            raise ValueError(f"After reshape mismatch: objects_map={objmap.shape}, positions={pos.shape}")
-        self.objects_map = objmap.astype(np.float32)
-        self.positions = pos.astype(np.float32)
-        self.N, self.L, self.V = self.objects_map.shape
-
-    def __len__(self) -> int:
-        return int(self.N)
-
-    def __getitem__(self, idx: int):
-        semantic = self.objects_map[idx]   # (L,V)
-        pos = self.positions[idx]          # (L,3)
-        l, _ = semantic.shape
-        k = self.max_tokens_per_frame
-
-        token_ids = np.full((l, k), self.pad_token_id, dtype=np.int64)
-        token_mask = np.zeros((l, k), dtype=np.bool_)
-
-        for t in range(l):
-            active = np.where(semantic[t] > self.thr)[0]
-            if active.size == 0:
-                continue
-            ids = self.tokenizer.encode_frame(active, self.vocabulary)[:k]
-            n_valid = len(ids)
-            token_ids[t, :n_valid] = np.array(ids, dtype=np.int64)
-            token_mask[t, :n_valid] = True
-
-        return (
-            torch.from_numpy(token_ids),    # (L,K)
-            torch.from_numpy(token_mask),   # (L,K)
-            torch.from_numpy(semantic),     # (L,V)
-            torch.from_numpy(pos),          # (L,3)
-        )
-
-
-@torch.no_grad()
-def extract_and_cache_latents(
-    model: SemanticFrameAutoencoder,
-    device: torch.device,
-    vocabulary: np.ndarray,
-    tokenizer: SubwordTokenizer,
-) -> None:
-    if LATENT_SOURCE not in {"pooled", "bottleneck"}:
-        raise ValueError(f"LATENT_SOURCE must be 'pooled' or 'bottleneck', got {LATENT_SOURCE}")
-
-    ds = PredefinedPathSemanticDatasetWithPos(
-        root=Path(EXTRACT_DATA_ROOT),
-        vocabulary=vocabulary,
-        subword_tokenizer=tokenizer,
-        sequence_length=SEQUENCE_LENGTH,
-        max_tokens_per_frame=MAX_TOKENS_PER_FRAME,
-        pad_token_id=PAD_TOKEN_ID,
-    )
-    loader = DataLoader(ds, batch_size=EXTRACT_BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
-
-    z_list = []
-    pos_list = []
-    sem_list = []
-    logits_list = []
-
-    model.eval()
-    for token_ids, token_mask, targets, pos in loader:
-        token_ids = token_ids.to(device)      # (B,L,K)
-        token_mask = token_mask.to(device)    # (B,L,K)
-        targets = targets.to(device)          # (B,L,V)
-
-        b, l, k = token_ids.shape
-        v = targets.shape[-1]
-        token_ids_f = token_ids.reshape(b * l, k)
-        token_mask_f = token_mask.reshape(b * l, k)
-
-        logits_f, lat = model(token_ids_f, token_mask_f, return_latents=True)
-        feat_f = lat[LATENT_SOURCE]                  # (B*L, D_or_Z)
-        c = feat_f.shape[-1]
-        feat = feat_f.view(b, l, c).cpu().numpy()   # (B,L,C)
-        z = feat[:, :, :, None, None]                # (B,L,C,1,1)
-
-        logits = logits_f.view(b, l, v).cpu().numpy()    # (B,L,V)
-        z_list.append(z)
-        pos_list.append(pos.numpy())
-        sem_list.append(targets.cpu().numpy())
-        logits_list.append(logits)
-
-    z_all = np.concatenate(z_list, axis=0)
-    pos_all = np.concatenate(pos_list, axis=0)
-    sem_all = np.concatenate(sem_list, axis=0)
-    logits_all = np.concatenate(logits_list, axis=0)
-
-    out_npz = Path(EXTRACT_OUT_NPZ)
-    out_npz.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_npz,
-        z=z_all,
-        positions=pos_all,
-        semantics=sem_all,
-        semantic_logits=logits_all,
-        latent_source=np.array([LATENT_SOURCE]),
-    )
-    print(f"[extract] saved: {out_npz}")
-    print(f"[extract] z={z_all.shape} positions={pos_all.shape} semantics={sem_all.shape}")
-
-
-def main() -> None:
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    out_dir = Path(OUT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    train_loader, val_loader, vocab_size, num_classes = build_dataloaders()
-    _, vocabulary = load_vocabulary(Path(DATA_ROOT))
-    tokenizer = SubwordTokenizer(vocabulary)
-
     model = SemanticFrameAutoencoder(
-        vocab_size=vocab_size,
-        d_model=D_MODEL,
-        num_classes=num_classes,
-        bottleneck_dim=BOTTLENECK_DIM,
-        hidden_dim=HIDDEN_DIM,
-        padding_idx=PAD_TOKEN_ID,
-        dropout=DROPOUT,
+        vocab_size=tokenizer.vocab_size,
+        d_model=args.d_model,
+        num_classes=tokenizer.num_classes,
+        bottleneck_dim=args.bottleneck_dim,
+        hidden_dim=args.hidden_dim,
+        padding_idx=tokenizer.pad_id,
+        dropout=args.dropout,
     ).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    config = {
+        **vars(args),
+        "data_root": str(data_root),
+        "val_data_root": str(val_data_root) if val_data_root else "",
+        "out_dir": str(out_dir),
+        "vocab_path": str(vocab_path) if vocab_path else "",
+        "vocab_source": vocab_source,
+        "vocab_size": tokenizer.vocab_size,
+        "num_classes": tokenizer.num_classes,
+        "tokenizer_type": "atomic",
+        "horizon": 0,
+        "objective": "same_frame_reconstruction",
+        "state_used_as_input": False,
+        "actions_used_as_input": False,
+    }
+    with (out_dir / "config.json").open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
 
-    history_train = []
-    history_val = []
-    best_val = float("inf")
-    patience = 0
+    print(f"[setup] data_root={data_root} out_dir={out_dir}")
+    print(
+        f"[setup] frames={train_raw.num_frames} episodes={train_raw.num_episodes} "
+        f"train_samples={len(train_dataset)} val_samples={len(val_dataset)}"
+    )
+    print(
+        "[setup] objective=same_frame_reconstruction temporal_input=false "
+        "state_input=false actions_input=false tokenizer=atomic"
+    )
 
-    print(f"[setup] device={device} vocab_size={vocab_size} num_classes={num_classes}")
-    print(f"[setup] train_batches={len(train_loader)} val_batches={len(val_loader)}")
-
-    for epoch in range(1, EPOCHS + 1):
-        tr = train_one_epoch(model, train_loader, optimizer, device)
-        va = eval_loss(model, val_loader, device)
-        history_train.append(tr)
-        history_val.append(va)
-        print(f"[epoch {epoch:03d}] train_loss={tr:.6f} val_loss={va:.6f}")
-
-        torch.save(model.state_dict(), out_dir / "last.ckpt")
-        if va < best_val:
-            best_val = va
-            patience = 0
-            torch.save(model.state_dict(), out_dir / "best.ckpt")
+    train_history: list[float] = []
+    val_history: list[float] = []
+    best_val_loss = float("inf")
+    stale_epochs = 0
+    for epoch in range(1, args.epochs + 1):
+        train_loss = run_epoch(model, train_loader, device, optimizer)
+        val_loss = run_epoch(model, val_loader, device, None)
+        train_history.append(train_loss)
+        val_history.append(val_loss)
+        improved = val_loss < best_val_loss
+        if improved:
+            best_val_loss = val_loss
+            stale_epochs = 0
         else:
-            patience += 1
-            if EARLY_STOPPING_PATIENCE > 0 and patience >= EARLY_STOPPING_PATIENCE:
-                print(f"[early_stop] no val improvement for {patience} epochs")
-                break
+            stale_epochs += 1
+        payload = checkpoint_payload(
+            model, optimizer, config, tokenizer, epoch, best_val_loss
+        )
+        torch.save(payload, out_dir / "last.ckpt")
+        if improved:
+            torch.save(payload, out_dir / "best.ckpt")
+        np.save(out_dir / "train_loss.npy", np.asarray(train_history, dtype=np.float32))
+        np.save(out_dir / "val_loss.npy", np.asarray(val_history, dtype=np.float32))
+        print(
+            f"[epoch {epoch:03d}] train_loss={train_loss:.6f} "
+            f"val_loss={val_loss:.6f}"
+        )
+        if args.early_stopping_patience > 0 and stale_epochs >= args.early_stopping_patience:
+            print(f"[early_stop] no validation improvement for {stale_epochs} epochs")
+            break
 
-    np.save(out_dir / "train_loss.npy", np.array(history_train, dtype=np.float32))
-    np.save(out_dir / "val_loss.npy", np.array(history_val, dtype=np.float32))
-    if EXTRACT_LATENTS_AFTER_TRAIN:
-        best_ckpt = out_dir / "best.ckpt"
-        if best_ckpt.exists():
-            state = torch.load(best_ckpt, map_location=device, weights_only=True)
-            model.load_state_dict(state, strict=True)
-        extract_and_cache_latents(model, device, vocabulary=vocabulary, tokenizer=tokenizer)
-    print(f"[done] saved to {out_dir}")
+    if args.extract_data_root:
+        extract_root = resolve_path(args.extract_data_root)
+        extract_out = (
+            resolve_path(args.extract_out_npz)
+            if args.extract_out_npz
+            else out_dir / "semantic_ae_latents.npz"
+        )
+        try:
+            checkpoint = torch.load(
+                out_dir / "best.ckpt", map_location=device, weights_only=False
+            )
+        except TypeError:
+            checkpoint = torch.load(out_dir / "best.ckpt", map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        extract_latents(model, tokenizer, args, device, extract_root, extract_out)
+    print(f"[done] best_val_loss={best_val_loss:.6f} checkpoint={out_dir / 'best.ckpt'}")
 
 
 if __name__ == "__main__":
     main()
-
