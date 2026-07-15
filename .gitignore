@@ -29,6 +29,11 @@ vlmpc_*/
 *.jpeg
 *.svg
 *.mp4
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
 
 # Temporary files
 _tmp_*
