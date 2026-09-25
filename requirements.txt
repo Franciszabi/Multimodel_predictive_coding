@@ -1,5 +1,6 @@
 numpy
-torch
+torch>=2.3
+Pillow
 
 matplotlib
 scikit-learn

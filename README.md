@@ -4,6 +4,11 @@ This repository contains the active semantic-only pipeline for the Twin Mansion
 predictive-coding experiments. Data, checkpoints, generated analyses, and legacy
 multimodal scripts are intentionally excluded from version control.
 
+An independent RGB-only predictive baseline is now available alongside this
+semantic pipeline. See [VISUAL_TRAINING.md](VISUAL_TRAINING.md) for its architecture,
+Colab timing/training commands, prediction evaluation and latent exports. Legacy
+models are preserved; the new visual entry point is `train_visual_predictive.py`.
+
 ## Scientific Contract
 
 `SemanticGPT` is a future-prediction model. For a window starting at frame `s`:
