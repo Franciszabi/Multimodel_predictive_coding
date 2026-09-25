@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Subset
 
 from src.data.trail_visual_dataset import TrailVisualSequenceDataset
 from src.models.visual_predictive import VisualPredictiveModel
+from src.training_progress import EpochTimer, batch_progress, timing_summary
 
 
 ROOT = Path(__file__).resolve().parent
@@ -101,27 +102,32 @@ def train_step(model, batch, optimizer, scaler, device, dtype, grad_clip):
     return float(loss.detach()), len(images), scaler.get_scale() >= old_scale
 
 
-def train_batches(model, loader, optimizer, scaler, device, dtype, grad_clip, steps=None, scheduler=None):
+def train_batches(
+    model, loader, optimizer, scaler, device, dtype, grad_clip, steps=None, scheduler=None,
+    *, progress=True, description="Train",
+):
     model.train()
     steps = len(loader) if steps is None else steps
     sync(device)
     start = time.perf_counter()
-    iterator = iter(loader)
     data_seconds, loss_sum, samples, skipped_steps = 0.0, 0.0, 0, 0
-    for _ in range(steps):
-        waiting = time.perf_counter()
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            iterator = iter(loader)
-            batch = next(iterator)
-        data_seconds += time.perf_counter() - waiting
-        loss, count, updated = train_step(model, batch, optimizer, scaler, device, dtype, grad_clip)
-        skipped_steps += int(not updated)
-        if scheduler is not None and updated:
-            scheduler.step()
-        loss_sum += loss * count
-        samples += count
+    with batch_progress(range(steps), desc=description, enabled=progress) as batches:
+        iterator = iter(loader)
+        for _ in batches:
+            waiting = time.perf_counter()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(loader)
+                batch = next(iterator)
+            data_seconds += time.perf_counter() - waiting
+            loss, count, updated = train_step(model, batch, optimizer, scaler, device, dtype, grad_clip)
+            skipped_steps += int(not updated)
+            if scheduler is not None and updated:
+                scheduler.step()
+            loss_sum += loss * count
+            samples += count
+            batches.set_postfix(loss=f"{loss_sum / samples:.6f}", refresh=False)
     sync(device)
     seconds = time.perf_counter() - start
     return {
@@ -134,27 +140,29 @@ def train_batches(model, loader, optimizer, scaler, device, dtype, grad_clip, st
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, dtype):
+def evaluate(model, loader, device, dtype, *, progress=True, description="Val"):
     model.eval()
     totals = dict(mse=0.0, persistence_mse=0.0, last_mse=0.0, last_persistence_mse=0.0)
     samples = 0
     preview = None
     sync(device)
     start = time.perf_counter()
-    for batch in loader:
-        images = batch["images"].to(device, non_blocking=True)
-        targets = batch["targets"].to(device, non_blocking=True)
-        with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
-            predictions = model(images)
-        errors = (predictions.float() - targets).square().mean(dim=(2, 3, 4))
-        baseline = (images - targets).square().mean(dim=(2, 3, 4))
-        totals["mse"] += errors.mean(1).sum().item()
-        totals["persistence_mse"] += baseline.mean(1).sum().item()
-        totals["last_mse"] += errors[:, -1].sum().item()
-        totals["last_persistence_mse"] += baseline[:, -1].sum().item()
-        samples += len(images)
-        if preview is None:
-            preview = [item[0].float().cpu() for item in (images, predictions, targets)]
+    with batch_progress(loader, desc=description, enabled=progress) as batches:
+        for batch in batches:
+            images = batch["images"].to(device, non_blocking=True)
+            targets = batch["targets"].to(device, non_blocking=True)
+            with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
+                predictions = model(images)
+            errors = (predictions.float() - targets).square().mean(dim=(2, 3, 4))
+            baseline = (images - targets).square().mean(dim=(2, 3, 4))
+            totals["mse"] += errors.mean(1).sum().item()
+            totals["persistence_mse"] += baseline.mean(1).sum().item()
+            totals["last_mse"] += errors[:, -1].sum().item()
+            totals["last_persistence_mse"] += baseline[:, -1].sum().item()
+            samples += len(images)
+            batches.set_postfix(loss=f"{totals['mse'] / samples:.6f}", copy=f"{totals['persistence_mse'] / samples:.6f}", refresh=False)
+            if preview is None:
+                preview = [item[0].float().cpu() for item in (images, predictions, targets)]
     result = {key: value / samples for key, value in totals.items()}
     if not all(np.isfinite(value) for value in result.values()):
         raise RuntimeError("Non-finite validation metric")
@@ -212,6 +220,7 @@ def parse_args(argv=None):
     p.add_argument("--limit_train_samples", type=int, default=0)
     p.add_argument("--limit_val_samples", type=int, default=0)
     p.add_argument("--device", default="auto")
+    p.add_argument("--no_progress", action="store_true", help="Hide batch progress bars; keep epoch summaries")
     p.add_argument("--amp", choices=("auto", "off", "fp16", "bf16"), default="auto")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--benchmark_steps", type=int, default=0)
@@ -292,10 +301,12 @@ def main(argv=None):
     print(f"[setup] model={args.model_type} L={args.sequence_length} h={args.horizon} images={args.image_size} heads={args.num_heads} layers={args.num_layers}", flush=True)
     print(f"[setup] device={args.device} amp={amp} params={config['parameters']:,} train_windows={len(train_data):,} workers={args.num_workers}", flush=True)
     if args.benchmark_steps:
-        warmup = train_batches(model, train_loader, optimizer, scaler, args.device, dtype, args.grad_clip, args.warmup_steps) if args.warmup_steps else None
+        warmup = train_batches(model, train_loader, optimizer, scaler, args.device, dtype, args.grad_clip, args.warmup_steps,
+                               progress=not args.no_progress, description="Warmup") if args.warmup_steps else None
         if args.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(args.device)
-        report = train_batches(model, train_loader, optimizer, scaler, args.device, dtype, args.grad_clip, args.benchmark_steps)
+        report = train_batches(model, train_loader, optimizer, scaler, args.device, dtype, args.grad_clip, args.benchmark_steps,
+                               progress=not args.no_progress, description="Benchmark")
         report.update(warmup=warmup, amp=amp, gpu=config["gpu"], workers=args.num_workers,
                       batch_size=args.batch_size, sequence_length=args.sequence_length,
                       horizon=args.horizon, image_size=args.image_size, train_windows=len(train_data),
@@ -309,12 +320,14 @@ def main(argv=None):
     val_raw = TrailVisualSequenceDataset(val_root or args.data_root, split="all" if val_root else "val", **common)
     val_data = Subset(val_raw, range(min(args.limit_val_samples, len(val_raw)))) if args.limit_val_samples > 0 else val_raw
     val_loader = make_loader(val_data, args)
+    timer = EpochTimer(args.epochs, start_epoch)
     for epoch in range(start_epoch, args.epochs + 1):
-        epoch_start = time.perf_counter()
         if args.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(args.device)
-        training = train_batches(model, train_loader, optimizer, scaler, args.device, dtype, args.grad_clip, scheduler=scheduler)
-        validation, preview = evaluate(model, val_loader, args.device, dtype)
+        training = train_batches(model, train_loader, optimizer, scaler, args.device, dtype, args.grad_clip, scheduler=scheduler,
+                                 progress=not args.no_progress, description=f"Train {epoch}/{args.epochs}")
+        validation, preview = evaluate(model, val_loader, args.device, dtype,
+                                       progress=not args.no_progress, description=f"Val {epoch}/{args.epochs}")
         improved = validation["mse"] < best
         best, stale = (validation["mse"], 0) if improved else (best, stale + 1)
         saving = time.perf_counter()
@@ -326,12 +339,13 @@ def main(argv=None):
         if improved:
             save_checkpoint(out / "best.ckpt", payload)
             save_preview(preview, out / "best_prediction.png", args.horizon)
+        timing = timer.finish_epoch(epoch)
         record = dict(epoch=epoch, train=training, validation=validation, best_val_loss=best,
                       peak_allocated_mb=torch.cuda.max_memory_allocated(args.device) / 2**20 if args.device.type == "cuda" else None,
-                      save_seconds=time.perf_counter() - saving, epoch_seconds=time.perf_counter() - epoch_start)
+                      save_seconds=time.perf_counter() - saving, **timing)
         with (out / "train_log.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, allow_nan=False) + "\n")
-        print(f"[epoch {epoch:03d}] train={training['loss']:.6f} val={validation['mse']:.6f} copy={validation['persistence_mse']:.6f} last={validation['last_mse']:.6f} train_s={training['seconds']:.1f} val_s={validation['seconds']:.1f} total_s={record['epoch_seconds']:.1f}", flush=True)
+        print(f"[epoch {epoch:03d}] train={training['loss']:.6f} val={validation['mse']:.6f} copy={validation['persistence_mse']:.6f} last={validation['last_mse']:.6f} train_s={training['seconds']:.1f} val_s={validation['seconds']:.1f} {timing_summary(timing)}", flush=True)
         if args.early_stopping_patience > 0 and stale >= args.early_stopping_patience:
             print("[early_stop] no validation improvement", flush=True)
             break

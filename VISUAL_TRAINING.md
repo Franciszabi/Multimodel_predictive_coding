@@ -104,6 +104,10 @@ forward, backward and optimizer are included; validation/checkpoint I/O are not.
 Warmup is separate. The estimate is approximate; a full epoch is the confirmation.
 Repeated/overlapping windows mean frame occurrences are not unique decoded images.
 
+Warmup and benchmark progress bars are enabled by default. They report batch
+counts, average loss, speed and ETA, including in Colab `!python` output. Use
+`--no_progress` to disable display for timing comparisons or redirected logs.
+
 Compare batch sizes 8/16 and worker counts 0/2/4 using fresh output directories.
 If GPU memory runs out, reduce batch size first. Keep L, h and image size fixed
 while comparing timing. `--cache_frames N` enables a per-worker float32 LRU cache;
@@ -124,6 +128,12 @@ Outputs: `config.json`, `train_log.jsonl`, `last.ckpt`, `best.ckpt` and
 `best_prediction.png` (input/prediction/true future). Epoch logs separate training,
 validation and save times. An existing nonempty output directory is refused.
 Use a new directory for every changed horizon, model or training recipe.
+
+Training and validation each show `epoch/max_epochs`, batch progress and phase
+ETA. At epoch end, `ETA(max_epochs)` estimates remaining wall-clock time including
+validation and checkpoint saving; early stopping may finish sooner. After resume,
+the estimate uses only epochs completed in the current run. Timing fields are also
+saved in `train_log.jsonl`. `--no_progress` keeps these epoch summaries and logs.
 
 To resume, repeat the same training command with `--resume "{RUN}/last.ckpt"`.
 For the default constant-LR schedule, `--epochs` can be increased; it is the total

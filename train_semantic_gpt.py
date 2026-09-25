@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from src.data.semantic_tokenizer import build_atomic_tokenizer
 from src.data.trail_semantic_dataset import TrailSemanticSequenceDataset
 from src.models.semantic_gpt import ATTENTION_MASK_MODES, SemanticGPT
+from src.training_progress import EpochTimer, batch_progress, timing_summary
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -79,6 +80,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--no_progress", action="store_true", help="Hide batch progress bars; keep epoch summaries")
     parser.add_argument("--early_stopping_patience", type=int, default=3)
     parser.add_argument("--limit_train_samples", type=int, default=0)
     parser.add_argument("--limit_val_samples", type=int, default=0)
@@ -144,41 +146,49 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    *, progress: bool = True, description: str = "Train",
 ) -> float:
     model.train()
     total_loss = 0.0
     total_samples = 0
-    for token_ids, token_mask, future_targets in loader:
-        token_ids = token_ids.to(device, non_blocking=True)
-        token_mask = token_mask.to(device, non_blocking=True)
-        future_targets = future_targets.to(device, non_blocking=True)
+    with batch_progress(loader, desc=description, enabled=progress) as batches:
+        for token_ids, token_mask, future_targets in batches:
+            token_ids = token_ids.to(device, non_blocking=True)
+            token_mask = token_mask.to(device, non_blocking=True)
+            future_targets = future_targets.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(token_ids, token_mask)
-        loss = F.binary_cross_entropy_with_logits(logits, future_targets)
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(token_ids, token_mask)
+            loss = F.binary_cross_entropy_with_logits(logits, future_targets)
+            loss.backward()
+            optimizer.step()
 
-        batch_size = token_ids.shape[0]
-        total_loss += float(loss.item()) * batch_size
-        total_samples += batch_size
+            batch_size = token_ids.shape[0]
+            total_loss += float(loss.item()) * batch_size
+            total_samples += batch_size
+            batches.set_postfix(loss=f"{total_loss / total_samples:.6f}", refresh=False)
     return total_loss / max(total_samples, 1)
 
 
 @torch.no_grad()
-def evaluate(model: SemanticGPT, loader: DataLoader, device: torch.device) -> float:
+def evaluate(
+    model: SemanticGPT, loader: DataLoader, device: torch.device,
+    *, progress: bool = True, description: str = "Val",
+) -> float:
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    for token_ids, token_mask, future_targets in loader:
-        token_ids = token_ids.to(device, non_blocking=True)
-        token_mask = token_mask.to(device, non_blocking=True)
-        future_targets = future_targets.to(device, non_blocking=True)
-        logits = model(token_ids, token_mask)
-        loss = F.binary_cross_entropy_with_logits(logits, future_targets)
-        batch_size = token_ids.shape[0]
-        total_loss += float(loss.item()) * batch_size
-        total_samples += batch_size
+    with batch_progress(loader, desc=description, enabled=progress) as batches:
+        for token_ids, token_mask, future_targets in batches:
+            token_ids = token_ids.to(device, non_blocking=True)
+            token_mask = token_mask.to(device, non_blocking=True)
+            future_targets = future_targets.to(device, non_blocking=True)
+            logits = model(token_ids, token_mask)
+            loss = F.binary_cross_entropy_with_logits(logits, future_targets)
+            batch_size = token_ids.shape[0]
+            total_loss += float(loss.item()) * batch_size
+            total_samples += batch_size
+            batches.set_postfix(loss=f"{total_loss / total_samples:.6f}", refresh=False)
     return total_loss / max(total_samples, 1)
 
 
@@ -308,9 +318,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     log_path = out_dir / "train_log.jsonl"
     log_path.write_text("", encoding="utf-8")
 
+    timer = EpochTimer(args.epochs)
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss = evaluate(model, val_loader, device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device,
+                                     progress=not args.no_progress, description=f"Train {epoch}/{args.epochs}")
+        val_loss = evaluate(model, val_loader, device,
+                            progress=not args.no_progress, description=f"Val {epoch}/{args.epochs}")
         train_history.append(train_loss)
         val_history.append(val_loss)
 
@@ -330,17 +343,20 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         np.save(out_dir / "train_loss.npy", np.asarray(train_history, dtype=np.float32))
         np.save(out_dir / "val_loss.npy", np.asarray(val_history, dtype=np.float32))
+        timing = timer.finish_epoch(epoch)
         log_record = {
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "best_val_loss": best_val_loss,
+            **timing,
         }
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(log_record) + "\n")
         print(
             f"[epoch {epoch:03d}] train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f}"
+            f"val_loss={val_loss:.6f} {timing_summary(timing)}",
+            flush=True,
         )
 
         if (

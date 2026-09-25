@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from src.data.semantic_tokenizer import build_atomic_tokenizer
 from src.data.trail_semantic_dataset import TrailSemanticSequenceDataset
 from src.models.semantic_autoencoder import SemanticFrameAutoencoder
+from src.training_progress import EpochTimer, batch_progress, timing_summary
 from train_semantic_gpt import limited_dataset, resolve_device, resolve_path, set_seed
 
 
@@ -40,6 +41,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--no_progress", action="store_true", help="Hide batch progress bars; keep epoch summaries")
     parser.add_argument("--early_stopping_patience", type=int, default=3)
     parser.add_argument("--limit_train_samples", type=int, default=0)
     parser.add_argument("--limit_val_samples", type=int, default=0)
@@ -108,14 +110,15 @@ def run_epoch(
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    *, progress: bool = True, description: str | None = None,
 ) -> float:
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
     total_frames = 0
     context = torch.enable_grad() if training else torch.no_grad()
-    with context:
-        for token_ids, token_mask, current_targets in loader:
+    with context, batch_progress(loader, desc=description or ("Train" if training else "Val"), enabled=progress) as batches:
+        for token_ids, token_mask, current_targets in batches:
             token_ids = token_ids.to(device, non_blocking=True)
             token_mask = token_mask.to(device, non_blocking=True)
             current_targets = current_targets.to(device, non_blocking=True)
@@ -131,6 +134,7 @@ def run_epoch(
                 optimizer.step()
             total_loss += float(loss.item()) * token_ids.shape[0]
             total_frames += token_ids.shape[0]
+            batches.set_postfix(loss=f"{total_loss / total_frames:.6f}", refresh=False)
     return total_loss / max(total_frames, 1)
 
 
@@ -305,9 +309,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     val_history: list[float] = []
     best_val_loss = float("inf")
     stale_epochs = 0
+    timer = EpochTimer(args.epochs)
     for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(model, train_loader, device, optimizer)
-        val_loss = run_epoch(model, val_loader, device, None)
+        train_loss = run_epoch(model, train_loader, device, optimizer,
+                              progress=not args.no_progress, description=f"Train {epoch}/{args.epochs}")
+        val_loss = run_epoch(model, val_loader, device, None,
+                            progress=not args.no_progress, description=f"Val {epoch}/{args.epochs}")
         train_history.append(train_loss)
         val_history.append(val_loss)
         improved = val_loss < best_val_loss
@@ -324,9 +331,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             torch.save(payload, out_dir / "best.ckpt")
         np.save(out_dir / "train_loss.npy", np.asarray(train_history, dtype=np.float32))
         np.save(out_dir / "val_loss.npy", np.asarray(val_history, dtype=np.float32))
+        timing = timer.finish_epoch(epoch)
         print(
             f"[epoch {epoch:03d}] train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f}"
+            f"val_loss={val_loss:.6f} {timing_summary(timing)}",
+            flush=True,
         )
         if args.early_stopping_patience > 0 and stale_epochs >= args.early_stopping_patience:
             print(f"[early_stop] no validation improvement for {stale_epochs} epochs")

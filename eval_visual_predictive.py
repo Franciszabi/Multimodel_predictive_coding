@@ -22,6 +22,7 @@ def main(argv=None):
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--limit_samples", type=int, default=0)
     p.add_argument("--device", default="auto")
+    p.add_argument("--no_progress", action="store_true", help="Hide batch progress bars")
     p.add_argument("--amp", choices=("auto", "off", "fp16", "bf16"), default="auto")
     args = p.parse_args(argv)
     if args.batch_size < 1 or min(args.num_workers, args.limit_samples) < 0:
@@ -39,7 +40,8 @@ def main(argv=None):
         split=args.split, val_fraction=config["val_fraction"],
     )
     data = Subset(dataset, range(min(args.limit_samples, len(dataset)))) if args.limit_samples else dataset
-    metrics, preview = evaluate(model, make_loader(data, args), args.device, dtype)
+    metrics, preview = evaluate(model, make_loader(data, args), args.device, dtype,
+                                progress=not args.no_progress, description="Evaluate")
     metrics.update(checkpoint=str(resolve_path(args.ckpt)), checkpoint_epoch=checkpoint["epoch"],
                    data_root=str(dataset.data_root), split=args.split, amp=amp,
                    sequence_length=dataset.sequence_length, horizon=dataset.horizon, stride=dataset.stride)

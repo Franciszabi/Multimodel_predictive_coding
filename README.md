@@ -9,6 +9,24 @@ semantic pipeline. See [VISUAL_TRAINING.md](VISUAL_TRAINING.md) for its architec
 Colab timing/training commands, prediction evaluation and latent exports. Legacy
 models are preserved; the new visual entry point is `train_visual_predictive.py`.
 
+## Training Progress
+
+The active visual, SemanticGPT and semantic AE trainers show text progress bars
+by default, including when launched with `!python` in Colab. Train/validation bars
+show batch counts, running average loss, speed, elapsed time and phase ETA.
+Epoch summaries also report wall-clock duration and `ETA(max_epochs)`, estimated
+from completed epochs including validation and saving. This estimate excludes
+initial setup and may overestimate the run when early stopping triggers.
+Visual benchmark warmup and measured steps have separate progress bars.
+
+Add `--no_progress` to hide batch bars while retaining epoch summaries. Display
+refreshes are throttled to about once per second; the first batches need to run
+before a useful speed/ETA is available. No notebook widget dependency is needed.
+
+New training entry points should reuse `src/training_progress.py`, enable progress
+by default, support `--no_progress`, and label each training/validation phase and
+epoch. Report phase ETA separately from the estimate to the configured epoch cap.
+
 ## Scientific Contract
 
 `SemanticGPT` is a future-prediction model. For a window starting at frame `s`:
