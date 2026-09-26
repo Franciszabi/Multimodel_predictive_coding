@@ -16,7 +16,7 @@ from train_visual_predictive import resolve_path, resolve_device, save_checkpoin
 from visual_latent_analysis import read_latents
 
 
-MATCH_KEYS = ("checkpoint_sha256", "layer", "pool", "sequence_length", "horizon", "image_size")
+MATCH_KEYS = ("checkpoint_sha256", "layer", "pool", "horizon", "image_size")
 
 
 class PositionDecoder(nn.Module):
@@ -40,12 +40,22 @@ def frame_span(indices, metadata):
             int(indices.max()) + int(metadata["horizon"]))
 
 
-def check_representation(train_meta, test_meta):
+def check_representation(train_meta, test_meta, *, allow_context_shift=False):
     for key in MATCH_KEYS:
         if train_meta[key] != test_meta[key]:
             raise ValueError(f"Decoder exports must match on {key}")
-    if train_meta.get("sampling_protocol", "trail_windows") != test_meta.get("sampling_protocol", "trail_windows"):
-        raise ValueError("Decoder exports must use the same sampling_protocol")
+    context_shift = {}
+    for key in ("sequence_length", "sampling_protocol"):
+        train_value = train_meta.get(key, "trail_windows") if key == "sampling_protocol" else train_meta[key]
+        test_value = test_meta.get(key, "trail_windows") if key == "sampling_protocol" else test_meta[key]
+        if train_value != test_value:
+            context_shift[key] = dict(training=train_value, evaluation=test_value)
+    if context_shift and not allow_context_shift:
+        differences = "; ".join(f"{key}: {value['training']} -> {value['evaluation']}"
+                                for key, value in context_shift.items())
+        raise ValueError(f"Decoder context differs ({differences}). Use --allow_context_shift only for an "
+                         "intentional cross-context evaluation; model weights/layer/shape checks remain strict.")
+    return context_shift
 
 
 def overlaps_training(training, indices, metadata):
@@ -146,6 +156,8 @@ def main(argv=None):
     mode.add_argument("--train_npz", help="Fit on this separate export; evaluate on --npz")
     mode.add_argument("--fit_on_eval", action="store_true", help="Explicit same-sample fit, as in James's public notebook; NOT held-out error")
     mode.add_argument("--ckpt", help="Evaluate a saved decoder without retraining")
+    parser.add_argument("--allow_context_shift", action="store_true",
+                        help="Allow different input lengths/sampling protocols; record this distribution shift in the report")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--map_root", default="", help="Optional Unity map metadata directory; auto-detected from --npz otherwise")
     parser.add_argument("--epochs", type=int, default=8000, help="Public-code default; paper text reports 2000 instead")
@@ -183,7 +195,8 @@ def main(argv=None):
         if payload.get("format") != "visual_position_decoder_v1":
             raise ValueError("Expected a visual_position_decoder_v1 checkpoint")
         training = payload["training"]
-        check_representation(training["metadata"], metadata)
+        context_shift = check_representation(training["metadata"], metadata,
+                                             allow_context_shift=args.allow_context_shift)
         model.load_state_dict(payload["model_state_dict"])
         protocol = "overlapping_training_support" if overlaps_training(training, indices, metadata) else "separate_export"
         out.mkdir(parents=True, exist_ok=True)
@@ -192,7 +205,7 @@ def main(argv=None):
             train, train_positions, train_indices, train_meta = latents, positions, indices, metadata
         else:
             train, train_positions, train_indices, train_meta = read_latents(args.train_npz)
-        check_representation(train_meta, metadata)
+        context_shift = check_representation(train_meta, metadata, allow_context_shift=args.allow_context_shift)
         if train.shape[1:] != (128, 8, 8):
             raise ValueError("Training latents must be [N,128,8,8]")
         training = dict(npz=str(resolve_path(args.train_npz or args.npz)), samples=len(train),
@@ -202,13 +215,19 @@ def main(argv=None):
             raise ValueError("Decoder train/evaluation supports overlap; use independent exports or explicitly --fit_on_eval")
         protocol = "same_sample_fit" if args.fit_on_eval else "separate_export"
         out.mkdir(parents=True, exist_ok=True)
+        if context_shift:
+            print(f"[context_shift] {json.dumps(context_shift)}; fitting uses training latents only", flush=True)
         print(f"[decoder] protocol={protocol} train={len(train)} eval={len(latents)} epochs={args.epochs} "
               f"device={args.device}; visual model is frozen", flush=True)
         payload = fit_decoder(model, train, train_positions, args, out, training)
+    if context_shift:
+        protocol += "_context_shift"
+        print(f"[context_shift] {json.dumps(context_shift)}; results are cross-context, not matched-context errors", flush=True)
     prediction = predict(model, latents, args.device, args.batch_size, payload["config"]["coordinate_scale"])
     errors = np.linalg.norm(prediction - positions, axis=1)
     baseline = np.linalg.norm(np.asarray(training["mean_position"]) - positions, axis=1)
     report = dict(method="james_public_code_position_decoder", protocol=protocol,
+                  context_shift=context_shift, allow_context_shift=args.allow_context_shift,
                   training=training, evaluation_metadata=metadata, config=payload["config"],
                   decoder_epoch=payload["epoch"], source_checkpoint=str(resolve_path(args.ckpt)) if args.ckpt else str(out / "decoder.ckpt"),
                   samples=len(latents), mean_distance=float(errors.mean()), median_distance=float(np.median(errors)),
@@ -219,6 +238,8 @@ def main(argv=None):
                                  gridsize=args.gridsize, vmax=args.error_vmax),
                   note="Same-sample/overlapping errors are fit errors, not generalization. Separate exports are held out "
                        "from this decoder only; duplicate recordings under different roots cannot be detected. "
+                       "A context_shift changes input length and/or sampling protocol, so errors combine trajectory "
+                       "generalization with a context distribution shift. "
                        "Public code uses 8000 epochs/decay at 4000 and no post-conv ReLU; paper prose differs. "
                        "Unlike the source diagnostic, logged coordinate MSE uses consistent units.")
     np.savez_compressed(out / "position_predictions.npz", predicted=prediction, true=positions, error=errors,

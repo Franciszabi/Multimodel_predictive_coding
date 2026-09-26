@@ -235,12 +235,48 @@ class VisualPipelineTests(unittest.TestCase):
         self.assertEqual([row["lr"] for row in logs], [1e-4, 1e-5])
         with self.assertRaises(ValueError):
             check_representation(meta, dict(meta, sequence_length=10))
+        self.assertEqual(check_representation(meta, dict(meta, sampling_protocol="trail_windows")), {})
+        with self.assertRaises(ValueError):
+            check_representation(meta, dict(meta, sampling_protocol="scan_anchor_groups"))
+        shifted_meta = dict(meta, sequence_length=10, sampling_protocol="scan_anchor_groups",
+                            data_root=str(root / "scan"))
+        shift = check_representation(meta, shifted_meta, allow_context_shift=True)
+        self.assertEqual(shift["sequence_length"], dict(training=25, evaluation=10))
+        self.assertEqual(shift["sampling_protocol"], dict(training="trail_windows", evaluation="scan_anchor_groups"))
+        for key, value in dict(checkpoint_sha256="another", layer="encoder", pool="spatial_mean",
+                               horizon=2, image_size=32).items():
+            with self.assertRaises(ValueError):
+                check_representation(meta, dict(shifted_meta, **{key: value}), allow_context_shift=True)
         with np.load(out / "error_map.npz") as values:
             self.assertEqual(len(values["mean_error"]), 4)
         reloaded = root / "reloaded"
         decoder_main(shared + ["--ckpt", str(out / "decoder.ckpt"), "--out_dir", str(reloaded)])
         with np.load(out / "position_predictions.npz") as a, np.load(reloaded / "position_predictions.npz") as b:
             np.testing.assert_allclose(a["predicted"], b["predicted"], atol=2e-5)
+        with np.load(root / "test.npz") as archive:
+            shifted = {key: archive[key] for key in archive.files}
+        shifted["metadata_json"] = np.asarray(json.dumps(shifted_meta))
+        shifted["input_indices"] = np.arange(4) * 10 + 9
+        np.savez_compressed(root / "scan.npz", **shifted)
+        scan_args = ["--npz", str(root / "scan.npz"), "--device", "cpu", "--no_progress",
+                     "--map_root", str(world)]
+        with self.assertRaisesRegex(ValueError, "allow_context_shift"):
+            decoder_main(scan_args + ["--ckpt", str(out / "decoder.ckpt"), "--out_dir", str(root / "rejected")])
+        scan_report = decoder_main(scan_args + ["--ckpt", str(out / "decoder.ckpt"),
+                                   "--out_dir", str(root / "scan_eval"), "--allow_context_shift"])
+        self.assertEqual(scan_report["protocol"], "separate_export_context_shift")
+        self.assertEqual(scan_report["context_shift"], shift)
+        with np.load(out / "position_predictions.npz") as a, np.load(root / "scan_eval" / "position_predictions.npz") as b:
+            np.testing.assert_allclose(a["predicted"], b["predicted"], atol=2e-5)
+        scan_fit = decoder_main(scan_args + ["--train_npz", str(root / "train.npz"),
+                                "--out_dir", str(root / "scan_fit"), "--allow_context_shift", "--epochs", "1"])
+        self.assertEqual(scan_fit["protocol"], "separate_export_context_shift")
+        self.assertEqual(scan_fit["training"]["metadata"]["sequence_length"], 25)
+        shifted["metadata_json"] = np.asarray(json.dumps(dict(shifted_meta, data_root=str(root / "train"))))
+        np.savez_compressed(root / "overlapping_scan.npz", **shifted)
+        with self.assertRaisesRegex(ValueError, "supports overlap"):
+            decoder_main(["--npz", str(root / "overlapping_scan.npz"), "--train_npz", str(root / "train.npz"),
+                          "--out_dir", str(root / "overlap_shift"), "--device", "cpu", "--allow_context_shift"])
         same = decoder_main(shared + ["--fit_on_eval", "--out_dir", str(root / "same"), "--epochs", "1"])
         self.assertEqual(same["protocol"], "same_sample_fit")
         with self.assertRaises(ValueError):

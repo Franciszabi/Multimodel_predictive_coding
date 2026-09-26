@@ -295,8 +295,8 @@ Evaluate saved weights without retraining:
 frame supports are rejected. Existing train25/val25 exports can be reused.
 The public `notebooks/predictive_coding.ipynb` instead loads
 `predictive-coder-environment-images.npy`, fits the decoder on those latents,
-then plots error on the **same** latents. This is neither an explicit visual
-train/validation split nor a held-out decoder evaluation. Reproduce that protocol
+then plots error on the **same** latents. The notebook calls these data a visual
+validation dataset, but they are not held out from the auxiliary decoder. Reproduce that protocol
 deliberately with `--fit_on_eval`; outputs are labeled `same_sample_fit`.
 
 ### Grid Scan Inference
@@ -325,9 +325,26 @@ and `--stride` behavior, but marks them `scan_collection_windows`. This includes
 artificial scan-order transitions and row jumps; its fields are conditional on
 that history, not the same experiment as independent local contexts. L=25
 permits longer history, but does not guarantee it is informative or in-distribution.
-Compare protocols separately. The decoder rejects unmatched context lengths or
-sampling protocols across fit/evaluation exports. Coordinates remain labels,
-never visual-model inputs.
+Compare protocols separately. By default the decoder rejects unmatched context
+lengths or sampling protocols across fit/evaluation exports. To intentionally
+test a trajectory-trained decoder on scan groups, reuse its saved weights:
+
+```python
+!python visual_position_decoder.py --ckpt "{RUN}/position_decoder_val/decoder.ckpt" \
+  --npz "{RUN}/latent_scan_groups.npz" --out_dir "{RUN}/position_decoder_scan_transfer" \
+  --allow_context_shift --map_root "{SCAN_ROOT}" --device cuda
+```
+
+This performs inference only, without fitting on scan coordinates. The same flag
+also works with `--train_npz` when a new decoder needs to be fitted. Outputs are
+labeled `separate_export_context_shift` for independent exports and record the
+actual train/evaluation context differences in `report.json`. For train L=25
+versus scan L=10, this tests transfer across both trajectories and input context;
+it is not a matched-context generalization comparison. Visual checkpoint, layer,
+pooling, horizon, image size and latent shape checks remain strict, as does the
+overlap guard when fitting a decoder. Do not edit NPZ metadata to bypass checks
+or concatenate teleports just to force matching lengths. Coordinates remain
+labels, never visual-model inputs.
 
 These checks do not establish significant place/grid cells or path integration.
 For those claims, add trajectory-aware nulls, cross-trajectory reliability,
