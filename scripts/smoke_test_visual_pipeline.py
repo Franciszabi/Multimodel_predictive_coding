@@ -11,12 +11,14 @@ from PIL import Image
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.data.trail_visual_dataset import TrailVisualSequenceDataset, image_relative_path
+from src.data.trail_visual_dataset import TrailVisualSequenceDataset, ScanVisualSequenceDataset, image_relative_path
 from src.models.visual_predictive import VisualPredictiveModel
 from train_visual_predictive import main as train_main, load_visual_checkpoint
 from visual_predictive_latent import main as export_main
 from visual_latent_analysis import main as analysis_main
 from eval_visual_predictive import main as eval_main
+from visual_position_decoder import PositionDecoder, check_representation, main as decoder_main
+from src.spatial_plotting import load_map_overlay, validate_map_positions
 
 
 def make_trail(root, frames=32):
@@ -154,12 +156,101 @@ class VisualPipelineTests(unittest.TestCase):
             self.assertEqual(result["input_indices"][0], 2)
             self.assertEqual(result["target_indices"][0], 3)
             np.testing.assert_equal(result["state"][0], [2, 0, 0])
-        analysis = analysis_main(["--npz", str(self.root / "test.npz"), "--train_npz", str(self.root / "train.npz"),
+        analysis = analysis_main(["--npz", str(self.root / "test.npz"),
                                   "--out_dir", str(self.root / "analysis"), "--bins", "3", "--min_occupancy", "1", "--units", "2"])
-        self.assertIn("position_probe", analysis)
+        self.assertEqual(analysis["place_fields"]["channels"], 128)
+        self.assertNotIn("position_probe", analysis)
+
+    def test_scan_groups_and_export(self):
+        root = self.root / "scan"
+        make_trail(root, frames=30)
+        records = [json.loads(line) for line in (root / "frame_index.jsonl").read_text().splitlines()]
+        groups = []
+        for index, record in enumerate(records):
+            record.update(anchor_id=f"anchor{index // 10}", shift_id=index % 10)
+            if index % 10 == 0:
+                groups.append(dict(anchor_id=record["anchor_id"], status="complete", samples=[]))
+            groups[-1]["samples"].append(dict(record))
+        (root / "frame_index.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+        groups[0]["samples"].reverse()
+        (root / "groups.json").write_text(json.dumps(groups))
+        data = ScanVisualSequenceDataset(root, image_size=64)
+        self.assertEqual(len(data), 3)
+        self.assertEqual(data.sequence_length, 10)
+        self.assertEqual(data[2]["input_indices"].tolist(), list(range(20, 30)))
+        self.assertNotIn("targets", data[2])
+        checkpoint = self.root / "scan_model.ckpt"
+        model = VisualPredictiveModel()
+        torch.save(dict(format="visual_predictive_v1", epoch=1, model_state_dict=model.state_dict(),
+                        config=dict(sequence_length=25, horizon=1, image_size=64, val_fraction=0.1,
+                                    num_heads=8, num_layers=2, model_type="predictive", position_encoding="none")), checkpoint)
+        result = self.root / "scan_latents.npz"
+        export_main(["--ckpt", str(checkpoint), "--data_root", str(root), "--scan_groups",
+                     "--out_npz", str(result), "--device", "cpu", "--num_workers", "0"])
+        with np.load(result) as archive:
+            self.assertEqual(archive["latents"].shape, (3, 128, 8, 8))
+            np.testing.assert_array_equal(archive["input_indices"], [9, 19, 29])
+            np.testing.assert_array_equal(archive["state"], np.load(root / "state.npy")[[9, 19, 29]])
+            self.assertNotIn("target_indices", archive.files)
+            meta = json.loads(str(archive["metadata_json"]))
+            self.assertEqual(meta["training_sequence_length"], 25)
+            self.assertEqual(meta["sequence_length"], 10)
+        groups[0]["samples"][0]["shift_id"] = 0
+        (root / "groups.json").write_text(json.dumps(groups))
         with self.assertRaises(ValueError):
-            analysis_main(["--npz", str(self.root / "test.npz"), "--train_npz", str(self.root / "test.npz"),
-                           "--out_dir", str(self.root / "overlap"), "--units", "1"])
+            ScanVisualSequenceDataset(root)
+
+    def test_position_decoder_and_overlays(self):
+        root = self.root / "decoder_test"
+        root.mkdir()
+        world = root / "map"
+        world.mkdir()
+        (world / "map.json").write_text(json.dumps(dict(minX=-6, minZ=-6, cellW=2, cellH=3, W=6, H=4)))
+        (world / "navigation.json").write_text(json.dumps(dict(roomSpacingMeters=6, rooms=[
+            dict(roomId="R00", center=dict(x=-3, z=0)), dict(roomId="R01", center=dict(x=3, z=0))])))
+        obstacles = np.zeros((4, 6), dtype=np.uint8)
+        obstacles[1, 3] = 1
+        np.save(world / "occupancy.npy", obstacles)
+        overlay = load_map_overlay(world)
+        self.assertEqual(overlay["extent"], (-6, 6, -6, 6))
+        self.assertTrue(overlay["occupancy"][1, 3])
+        with self.assertRaises(ValueError):
+            validate_map_positions(overlay, np.array([[7, 0]]))
+        rng = np.random.default_rng(43)
+        for name in ("train", "test"):
+            meta = dict(format="visual_latent_v1", data_root=str(root / name), checkpoint_sha256="test",
+                        layer="final", pool="none", sequence_length=25, horizon=1, image_size=64)
+            np.savez_compressed(root / f"{name}.npz", latents=rng.normal(size=(4, 128, 8, 8)).astype(np.float32),
+                                state=np.array([[-4, -4, 0], [-1, 2, 0], [2, -1, 0], [4, 4, 0]]),
+                                input_indices=np.arange(4) * 25 + 24, metadata_json=np.asarray(json.dumps(meta)))
+        shared = ["--npz", str(root / "test.npz"), "--device", "cpu", "--no_progress", "--map_root", str(world)]
+        out = root / "fit"
+        report = decoder_main(shared + ["--train_npz", str(root / "train.npz"), "--out_dir", str(out),
+                                        "--epochs", "2", "--lr_step", "1", "--batch_size", "3"])
+        self.assertEqual(report["protocol"], "separate_export")
+        self.assertTrue((out / "decoder.ckpt").is_file())
+        self.assertTrue((out / "error_map.png").is_file())
+        logs = [json.loads(line) for line in (out / "decoder_train_log.jsonl").read_text().splitlines()]
+        self.assertEqual([row["samples"] for row in logs], [3, 3])
+        self.assertEqual([row["lr"] for row in logs], [1e-4, 1e-5])
+        with self.assertRaises(ValueError):
+            check_representation(meta, dict(meta, sequence_length=10))
+        with np.load(out / "error_map.npz") as values:
+            self.assertEqual(len(values["mean_error"]), 4)
+        reloaded = root / "reloaded"
+        decoder_main(shared + ["--ckpt", str(out / "decoder.ckpt"), "--out_dir", str(reloaded)])
+        with np.load(out / "position_predictions.npz") as a, np.load(reloaded / "position_predictions.npz") as b:
+            np.testing.assert_allclose(a["predicted"], b["predicted"], atol=2e-5)
+        same = decoder_main(shared + ["--fit_on_eval", "--out_dir", str(root / "same"), "--epochs", "1"])
+        self.assertEqual(same["protocol"], "same_sample_fit")
+        with self.assertRaises(ValueError):
+            decoder_main(shared + ["--train_npz", str(root / "test.npz"), "--out_dir", str(root / "overlap")])
+        with self.assertRaises(ValueError):
+            PositionDecoder()(torch.rand(2, 128, 1, 1))
+        analysis = analysis_main(["--npz", str(root / "test.npz"), "--out_dir", str(root / "fields"),
+                                  "--map_root", str(world), "--units", "2"])
+        self.assertEqual(analysis["map_overlay"]["rooms"], 2)
+        self.assertEqual(analysis["place_fields"]["spatial_range"], [[-6.0, 6.0], [-6.0, 6.0]])
 
     def test_windows_worker(self):
         dataset = TrailVisualSequenceDataset(self.trail, 3, 1, image_size=16)

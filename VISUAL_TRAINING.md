@@ -160,7 +160,7 @@ Suggested controls, each in its own output directory:
 Use identical evaluated frame IDs, image preprocessing and training budgets when
 comparing these controls. Their default window counts differ with L and h.
 
-## Latents and Initial Spatial Checks
+## Latents and Spatial Analysis
 
 Export the last input position only, giving a fixed context length and one latent
 per sampled window. `final` is after the second temporal FFN/normalization and
@@ -173,25 +173,165 @@ AE has `encoder` and `final` only. No layer is assumed to be the most informativ
 !python visual_predictive_latent.py --ckpt "{RUN}/best.ckpt" --data_root "{VAL_ROOT}" \
   --out_npz "{RUN}/latent_val.npz" --layer final --stride 25 --device cuda
 !python visual_latent_analysis.py --npz "{RUN}/latent_val.npz" \
-  --train_npz "{RUN}/latent_train.npz" --out_dir "{RUN}/spatial_analysis" \
-  --bins 30 --min_occupancy 3 --units 16
+  --out_dir "{RUN}/place_fields_q90_val" \
+  --quantile 0.9 --bins 30 --min_occupancy 1 --units 16
 ```
 
 Full feature maps are saved by default: `[N,128,8,8]` at 64px. `--pool spatial_mean`
-reduces storage to `[N,128,1,1]`, but changes the representation being analyzed.
+reduces storage to `[N,128,1,1]`. Both produce the same channel-mean representation
+for the place-field analysis, but pooling discards the feature-map layout needed
+by the James position decoder. Use `--pool none` (default) for position decoding.
 Export stops before allocating more than `--max_output_mb` (default 2048 MiB)
 for the latent array. Total process memory also includes model and image batches.
 
-Activation maps divide summed activation by occupancy and mask poorly sampled
-bins. The plotted units are fixed evenly spaced flattened indices, not cherry-picked.
-The optional Ridge probe uses 128 spatial-mean features, with scaler and weights
-fitted only on the training export. It predicts x,z and reports distance, R2 and
-a train-mean-position baseline on the evaluation export. It is an initial probe,
-not a replication of all analysis methods in the paper.
+### Reference-Style Place Fields
+
+`visual_latent_analysis.py` follows the calculation in the original
+[PlaceFields implementation](https://github.com/jgornet/predictive-coding-recovers-maps/blob/main/predictive_coding/analysis.py),
+also used by the legacy `src/analysis.py`:
+
+1. Average each channel over its feature-map axes: `[N,C,H,W] -> [N,C]`.
+2. Calculate each channel's 90th percentile over all samples in `--npz`.
+3. Select samples with activation **strictly greater than** that threshold.
+   Ties can yield fewer than 10% active samples; a constant channel has none.
+4. Histogram the selected samples' x/z positions. These are raw high-activation
+   counts, NOT average activations and NOT divided by occupancy.
+5. Define the binary field as `count > 0`. Fit a 2D Gaussian to the selected
+   continuous coordinates using their mean and sample covariance. Save the
+   public code's `approx_areas = pi * sqrt(det(covariance))` (one-sigma ellipse).
+
+The one-sigma area is not the paper text's fixed-density `P >= 0.0005` region.
+Gaussian densities are evaluated at the configured bin centers for display;
+the reference uses a finer display mesh. No covariance regularization is added:
+fewer than three active samples or a singular covariance gives an unavailable
+Gaussian, recorded in the report, while the raw and binary fields remain valid.
+
+All channels are computed and saved. `--units 16` selects fixed evenly spaced
+**channels only for plotting**, not flattened feature-map elements or top-ranked
+fields. Use `--units 128` to plot all channels of the current visual model.
+`--bins 30` uses 30 bins per axis; `--bins NX NZ` accepts different axis sizes.
+For comparable maps, specify the same `--spatial_range XMIN XMAX ZMIN ZMAX` and
+bins across exports. Otherwise exported map bounds are used when available,
+falling back to this export's position range.
+World coordinates are not hardcoded to the original Minecraft environment.
+
+`--min_occupancy` now defaults to 1, suitable for a scan with one exported sample
+per location. It is a **display-only mask**; it never changes thresholds, raw
+counts, binary fields, Gaussian fitting or coverage statistics. Empty bins are
+not labeled as obstacles, since this export alone cannot distinguish obstacles
+from locations that were not sampled.
+
+Outputs in a new analysis directory:
+
+- `place_fields.npz`: all channel means, thresholds, active-sample masks, high
+  activation counts, binary fields, occupancy, bin edges, Gaussian parameters,
+  fit status, densities, one-sigma areas and coverage counts.
+- `place_fields.png`: high-activation count maps with occupancy.
+- `place_fields_binary.png`: binary support of each channel's field.
+- `place_fields_gaussian.png`: fitted Gaussian density maps at sampled bins.
+- `place_field_statistics.png`: ellipse areas, fields per covered bin, and bins
+  per channel (including empty channels).
+- `report.json`: method, quantile, bounds, sampling metadata and diagnostics.
+
+Previous `activation_maps.*` outputs are not overwritten or silently relabeled.
+Existing `latent_train.npz`/`latent_val.npz` exports can be reused without training
+or exporting again; only rerun analysis into a new output directory.
+
+### Room and Obstacle Overlays
+
+Both place-field plots and decoder error maps read `map.json`, `navigation.json`
+and `occupancy.npy`. They auto-detect these files under the latent export's
+`data_root`; use `--map_root "{SCAN_ROOT}"` if files moved or use another compatible
+export of the **same map**. Map coordinates are x horizontally, z vertically.
+Gray marks exported obstacle occupancy (which can include agent-radius inflation).
+Dashed room cells use the exported room centers and spacing, with room IDs and
+door markers. These are room-layout guides, not exact wall/door polygons. No
+5-by-5 layout or fixed map size is hardcoded. The overlay never enters the model.
+
+### Separate James Position Decoder
+
+The previous Ridge probe and its `--train_npz`/`--ridge_alpha` options were removed
+from `visual_latent_analysis.py`. Position decoding now uses a separate script:
+
+```python
+!python visual_position_decoder.py --train_npz "{RUN}/latent_train.npz" \
+  --npz "{RUN}/latent_val.npz" --out_dir "{RUN}/position_decoder_val" \
+  --map_root "{SCAN_ROOT}" --device cuda
+```
+
+The visual model is frozen. Only the auxiliary decoder learns coordinates from
+saved **full `[N,128,8,8]`** latents: Conv2d(128,256,3,padding=1), MaxPool2d(2),
+Flatten, Linear(4096,64), ReLU, Linear(64,2). No channel averaging, scaler or Ridge.
+The default follows the public `PositionDecoder` source: float32, batch 512,
+AdamW lr=1e-4 / weight_decay=0.01, 8000 epochs, StepLR(4000,0.1), coordinates /30.
+Predictions are multiplied by 30 before Euclidean errors are measured. As in the
+source, shuffled remainders are dropped; for fewer than 512 samples we use one
+partial batch so training still occurs. The source's mis-scaled diagnostic log
+is corrected. A progress bar shows epoch progress/ETA. Weights/logs save every
+100 epochs and at the end (`--save_every` changes checkpoint frequency).
+
+The paper prose instead reports 1000+1000 epochs and a ReLU after convolution.
+This implementation matches the **public code**, not both conflicting versions.
+For a short execution check set `--epochs 200 --lr_step 100`, but label this as a
+shortened budget, not the source's training schedule. There is no validation-
+driven checkpoint selection or early stopping: the final decoder is evaluated.
+
+Outputs: `decoder.ckpt` (weights, optimizer, schedule, configuration and training
+provenance), `decoder_train_log.jsonl`, `position_predictions.npz` (predicted/true
+coordinates and per-sample error), `error_map.png`, `error_map.npz` (hexagon means),
+and `report.json`. The error map uses mean Euclidean error per hexagon, as in
+the source; x/z axes follow Unity rather than the source's rotated Minecraft map.
+Use a common `--error_vmax` across model comparisons; by default colors auto-scale.
+
+Evaluate saved weights without retraining:
+
+```python
+!python visual_position_decoder.py --ckpt "{RUN}/position_decoder_val/decoder.ckpt" \
+  --npz "{RUN}/latent_val.npz" --out_dir "{RUN}/position_decoder_val_rerender" \
+  --map_root "{SCAN_ROOT}" --device cuda
+```
+
+`--train_npz` fits only that export and evaluates `--npz`. Overlapping same-trail
+frame supports are rejected. Existing train25/val25 exports can be reused.
+The public `notebooks/predictive_coding.ipynb` instead loads
+`predictive-coder-environment-images.npy`, fits the decoder on those latents,
+then plots error on the **same** latents. This is neither an explicit visual
+train/validation split nor a held-out decoder evaluation. Reproduce that protocol
+deliberately with `--fit_on_eval`; outputs are labeled `same_sample_fit`.
+
+### Grid Scan Inference
+
+Training L=25 is a context length, not a fixed architectural input dimension.
+For James-style independent local contexts use each complete anchor's ten shifts:
+
+```python
+!python visual_predictive_latent.py --ckpt "{RUN}/best.ckpt" --data_root "{SCAN_ROOT}" \
+  --out_npz "{RUN}/latent_scan_groups.npz" --scan_groups --layer final --device cuda
+!python visual_latent_analysis.py --npz "{RUN}/latent_scan_groups.npz" \
+  --out_dir "{RUN}/place_fields_scan" --map_root "{SCAN_ROOT}" --units 16 --bins 64
+!python visual_position_decoder.py --npz "{RUN}/latent_scan_groups.npz" --fit_on_eval \
+  --out_dir "{RUN}/position_decoder_scan_fit" --map_root "{SCAN_ROOT}" --device cuda
+```
+
+`--scan_groups` reads complete groups, sorts shift IDs and validates image/index
+alignment. It exports one last-input latent per anchor and labels it with the
+**actual last shift's position**, not the anchor's first position. It needs no
+future target. It records actual L=10 separately from trained L=25; it neither
+repeats frames nor pads to 25. `pathN` folders remain storage chunks only.
+
+Concatenating A's ten frames, B's ten and C's first five is also computationally
+valid. Omitting `--scan_groups` retains the existing checkpoint-length windows
+and `--stride` behavior, but marks them `scan_collection_windows`. This includes
+artificial scan-order transitions and row jumps; its fields are conditional on
+that history, not the same experiment as independent local contexts. L=25
+permits longer history, but does not guarantee it is informative or in-distribution.
+Compare protocols separately. The decoder rejects unmatched context lengths or
+sampling protocols across fit/evaluation exports. Coordinates remain labels,
+never visual-model inputs.
 
 These checks do not establish significant place/grid cells or path integration.
 For those claims, add trajectory-aware nulls, cross-trajectory reliability,
-matched AE/current-frame controls, multiple seeds and the paper's exact metrics.
+matched AE/current-frame controls, multiple seeds and direction/history controls.
 Overlapping frame supports from the same trail are rejected for probe fitting;
 duplicate trajectories copied to different folders cannot be detected automatically.
 
@@ -203,7 +343,8 @@ python scripts/smoke_test_visual_pipeline.py
 
 Tests cover training/eval causality, history sensitivity, batch independence,
 image/target indexing, cross-folder windows, episode boundaries, temporal splits,
-AE independence, checkpoint resume, timing, evaluation, latent alignment and probes.
+AE independence, checkpoint resume, timing, evaluation, latent alignment,
+scan grouping, map overlays and the CNN position decoder.
 On Windows, if Anaconda reports duplicate OpenMP runtimes, run the test in a clean
 environment or set `MKL_THREADING_LAYER=SEQUENTIAL` for that process; do not enable
 the unsafe `KMP_DUPLICATE_LIB_OK` workaround.

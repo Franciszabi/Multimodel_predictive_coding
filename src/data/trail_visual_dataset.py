@@ -116,8 +116,8 @@ class TrailVisualSequenceDataset(Dataset):
         return tensor
 
     def __getitem__(self, index):
-        start = self.sequence_map[index]
-        inputs = np.arange(start, start + self.sequence_length, dtype=np.int64)
+        inputs = self.input_indices(index)
+        start = int(inputs[0])
         targets = inputs + self.horizon
         # Decode overlapping input/target images only once per sample.
         needed = np.union1d(inputs, targets) if self.return_targets else inputs
@@ -131,3 +131,52 @@ class TrailVisualSequenceDataset(Dataset):
                 episode_id=int(self.episodes[start]),
             )
         return sample
+
+    def input_indices(self, index):
+        start = self.sequence_map[index]
+        return np.arange(start, start + self.sequence_length, dtype=np.int64)
+
+
+class ScanVisualSequenceDataset(TrailVisualSequenceDataset):
+    """One ordered shift group per anchor, independent of path storage folders."""
+
+    def __init__(self, data_root, image_size=64):
+        super().__init__(data_root, sequence_length=1, horizon=0, stride=1,
+                         image_size=image_size, return_targets=False, return_metadata=True)
+        with (self.data_root / "groups.json").open(encoding="utf-8-sig") as handle:
+            groups = json.load(handle)
+        if not isinstance(groups, list):
+            raise ValueError("groups.json must be a list of scan anchor groups")
+        with (self.data_root / "frame_index.jsonl").open(encoding="utf-8-sig") as handle:
+            records = [json.loads(line) for line in handle]
+        steps = {int(record["globalStep"]): i for i, record in enumerate(records)}
+        self.group_indices, self.anchor_ids = [], []
+        used = set()
+        for group in groups:
+            if group.get("status") != "complete":
+                continue
+            samples = sorted(group["samples"], key=lambda sample: int(sample["shift_id"]))
+            if not samples or [int(s["shift_id"]) for s in samples] != list(range(len(samples))):
+                raise ValueError("Complete scan groups must contain every shift exactly once")
+            indices = []
+            for sample in samples:
+                index = steps[int(sample["globalStep"])]
+                record = records[index]
+                if (record["anchor_id"] != group["anchor_id"] or
+                        int(record["shift_id"]) != int(sample["shift_id"]) or
+                        image_relative_path(sample) != self.image_paths[index] or index in used):
+                    raise ValueError("Scan groups and frame index disagree or reuse a frame")
+                used.add(index)
+                indices.append(index)
+            if np.any(np.diff(indices) != 1):
+                raise ValueError("Expected anchor-major consecutive frames within each scan group")
+            self.group_indices.append(np.asarray(indices, dtype=np.int64))
+            self.anchor_ids.append(str(group["anchor_id"]))
+        lengths = {len(indices) for indices in self.group_indices}
+        if len(lengths) != 1 or len(set(self.anchor_ids)) != len(self.anchor_ids):
+            raise ValueError("Need nonempty complete scan groups of equal length and unique anchor IDs")
+        self.sequence_length = lengths.pop()
+        self.sequence_map = [int(indices[0]) for indices in self.group_indices]
+
+    def input_indices(self, index):
+        return self.group_indices[index]

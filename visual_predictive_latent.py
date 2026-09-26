@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import Subset
 
-from src.data.trail_visual_dataset import TrailVisualSequenceDataset
+from src.data.trail_visual_dataset import TrailVisualSequenceDataset, ScanVisualSequenceDataset
 from train_visual_predictive import load_visual_checkpoint, make_loader, resolve_device, resolve_path
 
 
@@ -23,6 +23,7 @@ def main(argv=None):
     p.add_argument("--layer", default="final", help="encoder, temporal_1, temporal_2, ... or final")
     p.add_argument("--pool", choices=("none", "spatial_mean"), default="none")
     p.add_argument("--stride", type=int, default=None, help="Defaults to checkpoint sequence_length")
+    p.add_argument("--scan_groups", action="store_true", help="Export one complete groups.json shift sequence per anchor; do not join anchors")
     p.add_argument("--split", choices=("all", "train", "val"), default="all")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=2)
@@ -46,12 +47,23 @@ def main(argv=None):
     valid_layers = {"encoder", "final"} | {f"temporal_{i+1}" for i in range(len(model.blocks))}
     if args.layer not in valid_layers:
         raise ValueError(f"Layer must be one of {sorted(valid_layers)}")
-    dataset = TrailVisualSequenceDataset(
-        resolve_path(args.data_root), sequence_length=config["sequence_length"], horizon=config["horizon"],
-        stride=args.stride if args.stride is not None else config["sequence_length"],
-        image_size=config["image_size"], split=args.split, val_fraction=config["val_fraction"],
-        return_metadata=True, return_targets=False,
-    )
+    if args.scan_groups:
+        if args.stride is not None or args.split != "all":
+            raise ValueError("--scan_groups exports one sample per complete anchor; omit --stride and use --split all")
+        dataset = ScanVisualSequenceDataset(resolve_path(args.data_root), image_size=config["image_size"])
+        sampling = "scan_anchor_groups"
+    else:
+        dataset = TrailVisualSequenceDataset(
+            resolve_path(args.data_root), sequence_length=config["sequence_length"], horizon=config["horizon"],
+            stride=args.stride if args.stride is not None else config["sequence_length"],
+            image_size=config["image_size"], split=args.split, val_fraction=config["val_fraction"],
+            return_metadata=True, return_targets=False,
+        )
+        sampling = "scan_collection_windows" if (dataset.data_root / "groups.json").is_file() else "trail_windows"
+        if sampling == "scan_collection_windows":
+            print("[sampling] Collection-order windows may cross scan anchors/row jumps; "
+                  "this is not the independent local-history scan protocol.", flush=True)
+    print(f"[sampling] {sampling} input_L={dataset.sequence_length} trained_L={config['sequence_length']}", flush=True)
     count = min(args.limit_samples, len(dataset)) if args.limit_samples else len(dataset)
     side = config["image_size"] // 8 if args.pool == "none" else 1
     shape = (count, 128, side, side)
@@ -80,13 +92,19 @@ def main(argv=None):
         checkpoint_epoch=checkpoint["epoch"], model_type=config["model_type"],
         checkpoint_sha256=checkpoint_hash.hexdigest(),
         layer=args.layer, pool=args.pool, temporal_position="last_input_frame",
-        sequence_length=config["sequence_length"], horizon=config["horizon"],
-        image_size=config["image_size"], stride=dataset.stride, split=args.split,
+        sequence_length=dataset.sequence_length, training_sequence_length=config["sequence_length"],
+        horizon=config["horizon"], sampling_protocol=sampling,
+        image_size=config["image_size"], stride=None if args.scan_groups else dataset.stride, split=args.split,
         state_used_as_input=False, state_columns=["x", "z", "yaw"],
     )
-    arrays = dict(latents=latents, input_indices=indices, target_indices=indices + config["horizon"],
+    arrays = dict(latents=latents, input_indices=indices,
                   episode_ids=episodes, metadata_json=np.asarray(json.dumps(metadata)),
                   image_paths=np.asarray([dataset.image_paths[i] for i in indices]))
+    if args.scan_groups:
+        arrays["anchor_ids"] = np.asarray(dataset.anchor_ids[:count])
+        arrays["window_input_indices"] = np.stack(dataset.group_indices[:count])
+    else:
+        arrays["target_indices"] = indices + config["horizon"]
     state_path = dataset.data_root / "state.npy"
     if state_path.exists():
         state = np.load(state_path, mmap_mode="r", allow_pickle=False)
