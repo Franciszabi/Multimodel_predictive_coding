@@ -23,6 +23,8 @@ def main(argv=None):
     p.add_argument("--layer", default="final", help="encoder, temporal_1, temporal_2, ... or final")
     p.add_argument("--pool", choices=("none", "spatial_mean"), default="none")
     p.add_argument("--stride", type=int, default=None, help="Defaults to checkpoint sequence_length")
+    p.add_argument("--context_length", type=int, default=None,
+                   help="Use only this many final input frames from each original window; preserve sample endpoints and horizon")
     p.add_argument("--scan_groups", action="store_true", help="Export one complete groups.json shift sequence per anchor; do not join anchors")
     p.add_argument("--split", choices=("all", "train", "val"), default="all")
     p.add_argument("--batch_size", type=int, default=8)
@@ -33,6 +35,8 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.batch_size < 1 or args.num_workers < 0 or args.limit_samples < 0 or args.max_output_mb < 1:
         raise ValueError("Invalid loader or output size settings")
+    if args.context_length is not None and args.context_length < 1:
+        raise ValueError("context_length must be positive")
     out = resolve_path(args.out_npz)
     if out.suffix != ".npz" or out.exists():
         raise ValueError("out_npz must be a new .npz file")
@@ -63,7 +67,12 @@ def main(argv=None):
         if sampling == "scan_collection_windows":
             print("[sampling] Collection-order windows may cross scan anchors/row jumps; "
                   "this is not the independent local-history scan protocol.", flush=True)
-    print(f"[sampling] {sampling} input_L={dataset.sequence_length} trained_L={config['sequence_length']}", flush=True)
+    context_length = args.context_length if args.context_length is not None else dataset.sequence_length
+    if context_length > dataset.sequence_length:
+        raise ValueError(f"context_length={context_length} exceeds sampling window length {dataset.sequence_length}; "
+                         "this option selects a suffix, not a longer window")
+    print(f"[sampling] {sampling} input_L={context_length} sampling_L={dataset.sequence_length} "
+          f"trained_L={config['sequence_length']}", flush=True)
     count = min(args.limit_samples, len(dataset)) if args.limit_samples else len(dataset)
     side = config["image_size"] // 8 if args.pool == "none" else 1
     shape = (count, 128, side, side)
@@ -76,7 +85,9 @@ def main(argv=None):
     loader = make_loader(Subset(dataset, range(count)), args)
     offset = 0
     for batch in loader:
-        layers = model.forward_features(batch["images"].to(args.device), return_layers=True)
+        # Keep the selected endpoint fixed while varying only its available history.
+        images = batch["images"][:, -context_length:]
+        layers = model.forward_features(images.to(args.device), return_layers=True)
         value = layers[args.layer][:, -1]
         if args.pool == "spatial_mean":
             value = value.mean(dim=(-2, -1), keepdim=True)
@@ -92,7 +103,8 @@ def main(argv=None):
         checkpoint_epoch=checkpoint["epoch"], model_type=config["model_type"],
         checkpoint_sha256=checkpoint_hash.hexdigest(),
         layer=args.layer, pool=args.pool, temporal_position="last_input_frame",
-        sequence_length=dataset.sequence_length, training_sequence_length=config["sequence_length"],
+        sequence_length=context_length, sampling_window_length=dataset.sequence_length,
+        context_selection="window_suffix", training_sequence_length=config["sequence_length"],
         horizon=config["horizon"], sampling_protocol=sampling,
         image_size=config["image_size"], stride=None if args.scan_groups else dataset.stride, split=args.split,
         state_used_as_input=False, state_columns=["x", "z", "yaw"],
@@ -102,7 +114,7 @@ def main(argv=None):
                   image_paths=np.asarray([dataset.image_paths[i] for i in indices]))
     if args.scan_groups:
         arrays["anchor_ids"] = np.asarray(dataset.anchor_ids[:count])
-        arrays["window_input_indices"] = np.stack(dataset.group_indices[:count])
+        arrays["window_input_indices"] = np.stack(dataset.group_indices[:count])[:, -context_length:]
     else:
         arrays["target_indices"] = indices + config["horizon"]
     state_path = dataset.data_root / "state.npy"
